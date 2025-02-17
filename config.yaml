@@ -1,0 +1,10 @@
+server:
+  address: "localhost"
+  port: 8080
+
+database:
+  host: "localhost"
+  port: 3306
+  user: "go_user"
+  pass: "password"
+  name: "go_db"

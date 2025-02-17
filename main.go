@@ -13,7 +13,23 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/go-sql-driver/mysql"
 	"google.golang.org/protobuf/encoding/protojson"
+	"github.com/spf13/viper"
 )
+
+type Config struct {
+	Server struct {
+		Address string `mapstructure:"address"`
+		Port    int    `mapstructure:"port"`
+	} `mapstructure:"server"`
+	Database struct {
+		Host string `mapstructure:"host"`
+		Port int    `mapstructure:"port"`
+		User string `mapstructure:"user"`
+		Pass string `mapstructure:"pass"`
+		Name string `mapstructure:"name"`
+	} `mapstructure:"database"`
+}
+
 
 func getUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Header().Set("Content-Type", "application/json")
@@ -37,7 +53,6 @@ func getUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, `{"error": "Failed to serialize user"}`, http.StatusInternalServerError)
 		return
 	}
-
 
 	w.WriteHeader(http.StatusOK)
 	w.Write(response)
@@ -86,11 +101,6 @@ func getUsers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	//Print the calculations for check up
-	totalPages := (totalUsers + limit - 1) / limit // This ensures rounding up
-	fmt.Println("Total Users:", totalUsers)
-	fmt.Println("Total Pages:", totalPages)
 
 	response, err := protojson.Marshal(users)
 	if err != nil {
@@ -169,7 +179,7 @@ func createUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		User:    &user,
 	}
 
-	// Encode response using protojson
+	// Encode response 
 	response, err := json.Marshal(responseData)
 	if err != nil {
 		http.Error(w, `{"error": "Error encoding response"}`, http.StatusInternalServerError)
@@ -300,7 +310,7 @@ func deleteUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Write(response)
 }
 
-func handleRequests(db *sql.DB) {
+func handleRequests(db *sql.DB, address string, port int) {
 	r := mux.NewRouter()
 
 	r.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
@@ -325,22 +335,23 @@ func handleRequests(db *sql.DB) {
 		}
 	})
 
-	fmt.Println("Server is running on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", r))
+	serverAddress := fmt.Sprintf("%s:%d", address, port)
+	fmt.Printf("Server is running on %s\n", serverAddress)
+	log.Fatal(http.ListenAndServe(serverAddress, r))
 }
 
 func initializeDB() (*sql.DB, error) {
 	// Connect as root to create the local database and user
-	rootDsn := "root:@tcp(127.0.0.1:3306)/"
+	rootDsn := "root:password@tcp(localhost:3306)/"
 	db, err := sql.Open("mysql", rootDsn)
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
 
-	// Create the database if it doesn't exist
+	// Create the database if it doesn't exist 
 	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS go_db")
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("Error creating database: %w", err)
 	}
 
@@ -349,26 +360,32 @@ func initializeDB() (*sql.DB, error) {
 	newPassword := "password"
 	_, err = db.Exec(fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'localhost' IDENTIFIED BY '%s'", newUser, newPassword))
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("Error creating user: %w", err)
 	}
 
 	// Grant all privileges on go_db to the new user
 	_, err = db.Exec(fmt.Sprintf("GRANT ALL PRIVILEGES ON go_db.* TO '%s'@'localhost'", newUser))
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("Error granting privileges: %w", err)
 	}
 
 	// Apply the changes in privileges
 	_, err = db.Exec("FLUSH PRIVILEGES")
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("Error flushing privileges: %w", err)
 	}
 
 	fmt.Println("Database and user successfully created!")
 
+	// Close the root connection
+	db.Close();
+
 	// Connect using the new user
-	userDsn := fmt.Sprintf("%s:%s@tcp(127.0.0.1:3306)/go_db", newUser, newPassword)
-	db, err = sql.Open("mysql", userDsn)
+	 userDsn := fmt.Sprintf("%s:%s@tcp(localhost:3306)/go_db", newUser, newPassword)
+	 db, err = sql.Open("mysql", userDsn)
 	if err != nil {
 		return nil, fmt.Errorf("Error connecting with new user: %w", err)
 	}
@@ -383,27 +400,68 @@ func initializeDB() (*sql.DB, error) {
 	);`
 	_, err = db.Exec(createTableQuery)
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("Error creating table: %w", err)
 	}
 
 	// Insert test data if the table has no records
 	_, err = db.Exec("INSERT INTO User (Name, Email, Age) SELECT * FROM (SELECT 'Amna Jusić', 'ajusic5@etf.unsa.ba', 25) AS tmp WHERE NOT EXISTS (SELECT * FROM User)")
 	if err != nil {
+		db.Close()
 		return nil, fmt.Errorf("Error inserting data: %w", err)
 	}
 
 	return db, nil
 }
 
-func main() {
-	//Connect to the database
-	db, err := initializeDB()
+func connectDB(config Config) (*sql.DB, error) {
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", config.Database.User, config.Database.Pass, config.Database.Host, config.Database.Port, config.Database.Name)
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
+	}
+
+	// Check database connection
+	if err := db.Ping(); err != nil {
+		return nil, err
+	}
+
+	return db, nil
+}
+
+func loadConfig() (Config, error) {
+	var config Config
+	viper.SetConfigFile("config.yaml")
+
+	if err := viper.ReadInConfig(); err != nil {
+		return config, err
+	}
+
+	err := viper.Unmarshal(&config)
+	if err != nil {
+		return config, err
+	}
+
+	return config, nil
+}
+
+func main() {
+
+	// Configuration loading
+	config, err := loadConfig()
+	if err != nil {
+		log.Fatalf("Error loading config: %v", err)
+	}
+
+	// Connect to a database
+	db, err := connectDB(config)
+	if err != nil {
+		// First time run
+		db, err = initializeDB()
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 	defer db.Close()
-
-	// Start the server
-	handleRequests(db)
-	
+	handleRequests(db, config.Server.Address, config.Server.Port)
 }
