@@ -8,30 +8,19 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
-
+	"io"
+	pb "github.com/ajusic5/test/proto"
 	"github.com/gorilla/mux"
 	"github.com/go-sql-driver/mysql"
+	"google.golang.org/protobuf/encoding/protojson"
 )
-
-type User struct {
-	ID    int 
-	Name  string 
-	Email string 
-	Age   int   
-}
-
-type UserResponse struct {
-	Name  string `json:"name"`
-	Email string `json:"email"`
-	Age   int    `json:"age"`
-}
 
 func getUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Header().Set("Content-Type", "application/json")
     params := mux.Vars(r)
     id := params["id"]
 
-    var user UserResponse
+    var user pb.User
     err := db.QueryRow("SELECT Name, Email, Age FROM User WHERE ID = ?", id).Scan(&user.Name, &user.Email, &user.Age)
     if err != nil {
         if err == sql.ErrNoRows {
@@ -42,8 +31,16 @@ func getUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
     }
 
+	// Converting protobuf object to JSON
+	response, err := protojson.Marshal(&user)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to serialize user"}`, http.StatusInternalServerError)
+		return
+	}
+
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(user)
+	w.Write(response)
 }
 
 func getUsers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -71,14 +68,15 @@ func getUsers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	}
 	defer rows.Close()
 
-	var users [] UserResponse
+	users := &pb.UserList{}
+
 	for rows.Next() {
-		var user UserResponse
+		user := pb.User{}
 		if err := rows.Scan(&user.Name, &user.Email, &user.Age); err != nil {
 			http.Error(w, `{"error": "Error reading user data"}`, http.StatusInternalServerError)
 			return
 		}
-		users = append(users, user)
+		users.Users = append(users.Users, &user)
 	}
 
 	// Check the total number of users to calculate total pages
@@ -94,8 +92,14 @@ func getUsers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	fmt.Println("Total Users:", totalUsers)
 	fmt.Println("Total Pages:", totalPages)
 
+	response, err := protojson.Marshal(users)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to encode users"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(users)
+	w.Write(response)
 }
 
 func isValidEmail(email string) bool {
@@ -111,29 +115,38 @@ func createUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		http.Error(w, `{"error": "Request body is empty"}`, http.StatusBadRequest)
 		return
 	}
-	
-	var u User
 
-	err := json.NewDecoder(r.Body).Decode(&u)
+	//read body into []byte
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
+		return
+	}
+	
+	var user pb.User
+
+	// Decode JSON to protobuf
+	err = protojson.Unmarshal(body, &user)
 	if err != nil {
 		http.Error(w, `{"error": "Invalid input"}`, http.StatusBadRequest)
 		return
 	}
 
-	if u.Name == "" || u.Email == "" {
+	if user.Name == "" || user.Email == "" {
 		http.Error(w, `{"error": "Name and Email are required"}`, http.StatusBadRequest)
 		return
 	}
 
-	if !isValidEmail(u.Email) {
+	if !isValidEmail(user.Email) {
 		http.Error(w, `{"error": "Invalid email format"}`, http.StatusBadRequest)
 		return
 	}
 
-	_, err = db.Exec("INSERT INTO User (Name, Email, Age) VALUES (?, ?, ?)", u.Name, u.Email, u.Age)
+	var res sql.Result
+	res, err = db.Exec("INSERT INTO User (Name, Email, Age) VALUES (?, ?, ?)", user.Name, user.Email, user.Age)
 	if err != nil {
 		if mysqlErr, ok := err.(*mysql.MySQLError); ok {
-			if mysqlErr.Number == 1062 { // 1062 je kod za DUPLICATE ENTRY
+			if mysqlErr.Number == 1062 { // 1062 Duplicate entry error
 				http.Error(w, `{"error": "Email is already in use"}`, http.StatusConflict)
 				return
 			}
@@ -142,8 +155,29 @@ func createUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	// Get inserted user ID
+	 lastInsertID, err := res.LastInsertId()
+	if err == nil {
+		user.Id = int32(lastInsertID)
+	} 
+	
+	responseData := struct {
+		Message string  `json:"message"`
+		User    *pb.User `json:"user"`
+	}{
+		Message: "User successfully created",
+		User:    &user,
+	}
+
+	// Encode response using protojson
+	response, err := json.Marshal(responseData)
+	if err != nil {
+		http.Error(w, `{"error": "Error encoding response"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(map[string]string{"message": "User successfully created"})
+	w.Write(response)
 }
 
 func updateUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -153,7 +187,7 @@ func updateUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	id := vars["id"]
 
 	// Retrieve existing user data
-	var existing User
+	var existing pb.User
 	err := db.QueryRow("SELECT Name, Email, Age FROM User WHERE ID=?", id).Scan(&existing.Name, &existing.Email, &existing.Age)
 	if err != nil {
 		http.Error(w, `{"error": "User not found"}`, http.StatusNotFound)
@@ -165,9 +199,16 @@ func updateUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	// Read request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to read request body"}`, http.StatusBadRequest)
+		return
+	}
+
 	// Decode the request body
-	var updates User
-	err = json.NewDecoder(r.Body).Decode(&updates)
+	var updates pb.User
+	err = protojson.Unmarshal(body, &updates)
 	if err != nil {
 		http.Error(w, `{"error": "Invalid input"}`, http.StatusBadRequest)
 		return
@@ -206,8 +247,23 @@ func updateUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	responseData := struct {
+		Message string  `json:"message"`
+		User    *pb.User `json:"user"`
+	}{
+		Message: "User successfully updated",
+		User:    &updates,
+	}
+
+	// Return updated user
+	response, err := json.Marshal(responseData)
+	if err != nil {
+		http.Error(w, `{"error": "Error encoding response"}`, http.StatusInternalServerError)
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"message": "User successfully updated"})
+	w.Write(response)
 }
 
 func deleteUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
@@ -233,8 +289,15 @@ func deleteUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		return
 	}
 
+	responseData := map[string]string{"message": "User successfully deleted"}
+	response, err := json.Marshal(responseData)
+	if err != nil {
+    	http.Error(w, `{"error": "Error encoding response"}`, http.StatusInternalServerError)
+    	return
+	}
+
 	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"message": "User successfully deleted"})
+	w.Write(response)
 }
 
 func handleRequests(db *sql.DB) {
