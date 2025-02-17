@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"strconv"
 
 	"github.com/gorilla/mux"
 	"github.com/go-sql-driver/mysql"
@@ -47,10 +48,25 @@ func getUser(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 
 func getUsers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 	w.Header().Set("Content-Type", "application/json")
-	rows, err := db.Query("SELECT Name, Email, Age FROM User") 
+
+	// Get query parameters for pagination
+	page, err := strconv.Atoi(r.URL.Query().Get("page"))
+	if err != nil || page < 1 {
+		page = 1
+	}
+
+	limit, err := strconv.Atoi(r.URL.Query().Get("limit"))
+	if err != nil || limit < 1 {
+		limit = 2 // Default value
+	}
+
+	//Calculate the offset
+	offset := (page - 1) * limit
+
+	// Query with pagination
+	rows, err := db.Query("SELECT Name, Email, Age FROM User LIMIT ? OFFSET ?", limit, offset)
 	if err != nil {
-		log.Println(err)
-		http.Error(w, "Error retrieving users", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
@@ -64,6 +80,19 @@ func getUsers(w http.ResponseWriter, r *http.Request, db *sql.DB) {
 		}
 		users = append(users, user)
 	}
+
+	// Check the total number of users to calculate total pages
+	var totalUsers int
+	err = db.QueryRow("SELECT COUNT(*) FROM User").Scan(&totalUsers)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	//Print the calculations for check up
+	totalPages := (totalUsers + limit - 1) / limit // This ensures rounding up
+	fmt.Println("Total Users:", totalUsers)
+	fmt.Println("Total Pages:", totalPages)
 
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(users)
