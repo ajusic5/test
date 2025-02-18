@@ -404,13 +404,6 @@ func initializeDB() (*sql.DB, error) {
 		return nil, fmt.Errorf("Error creating table: %w", err)
 	}
 
-	// Insert test data if the table has no records
-	_, err = db.Exec("INSERT INTO User (Name, Email, Age) SELECT * FROM (SELECT 'Amna Jusić', 'ajusic5@etf.unsa.ba', 25) AS tmp WHERE NOT EXISTS (SELECT * FROM User)")
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("Error inserting data: %w", err)
-	}
-
 	return db, nil
 }
 
